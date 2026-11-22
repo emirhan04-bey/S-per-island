@@ -1,6 +1,8 @@
 package com.example.dynamicisland
 
 import android.app.Activity
+import android.app.AlarmManager
+import android.app.AppOpsManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -9,11 +11,15 @@ import android.app.Service
 import android.app.usage.UsageEvents
 import android.app.usage.UsageStatsManager
 import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.content.res.ColorStateList
+import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.LayerDrawable
 import android.media.MediaMetadata
 import android.media.session.MediaController
 import android.media.session.MediaSessionManager
@@ -24,28 +30,48 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.Process
 import android.os.SystemClock
 import android.provider.Settings
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import android.text.TextUtils
-import android.transition.AutoTransition
+import android.text.format.DateFormat
+import android.transition.ChangeBounds
 import android.transition.TransitionManager
+import android.view.GestureDetector
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
+import android.view.ViewOutlineProvider
 import android.view.WindowManager
+import android.view.animation.OvershootInterpolator
 import android.widget.Button
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
 
-private val GREEN = Color.parseColor("#1DB954")
-private val BLUE = Color.parseColor("#4A9EFF")
-private val GRAY = Color.parseColor("#AAAAAA")
+// ============ Renkler ve ölçüler (tahmini, ekran görüntüsüyle ince ayar yapılabilir) ============
 
-// ============ Bildirim modeli ve paylaşılan köprü ============
+private val MUSIC_GREEN = Color.parseColor("#1DB954")
+private val NOTIF_BLUE = Color.parseColor("#4A9EFF")
+private val ALARM_ORANGE = Color.parseColor("#FF9F0A")
+private val SUBTLE = Color.parseColor("#9AA0A6")
+private val GLASS_TOP = Color.parseColor("#E61A1A1E")
+private val GLASS_BOTTOM = Color.parseColor("#D2000000")
+private val GLASS_RIM = Color.parseColor("#33FFFFFF")
+
+private const val SHOW_IDLE_CLOCK = true
+private const val ALARM_WINDOW_MS = 12L * 60 * 60 * 1000
+private const val AUTO_COLLAPSE_MS = 6000L
+private const val TOAST_MS = 4000L
+
+private fun Context.dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+// ============ Bildirim modeli ve köprü ============
 
 data class IslandNotif(
     val key: String,
@@ -136,28 +162,55 @@ class IslandNotificationListener : NotificationListenerService() {
 
 class DynamicIslandService : Service() {
 
+    private enum class Mode { HIDDEN, CLOCK, ALARM, MUSIC, NOTIF }
+
     private lateinit var wm: WindowManager
     private lateinit var params: WindowManager.LayoutParams
     private lateinit var root: LinearLayout
-    private lateinit var dotBg: GradientDrawable
-    private lateinit var compactBox: LinearLayout
-    private lateinit var compactTv: TextView
+    private lateinit var compactRow: LinearLayout
     private lateinit var expandedBox: LinearLayout
     private lateinit var notifBox: LinearLayout
     private lateinit var musicBox: LinearLayout
+    private lateinit var compactTv: TextView
+    private lateinit var appIcon: ImageView
     private lateinit var titleTv: TextView
     private lateinit var artistTv: TextView
     private lateinit var timeTv: TextView
     private lateinit var seekBar: SeekBar
-    private lateinit var playBtn: TextView
+    private lateinit var playBtn: ImageView
 
     private val handler = Handler(Looper.getMainLooper())
+    private var mode = Mode.HIDDEN
     private var current: MediaController? = null
     private var expanded = false
     private var musicVisible = false
+    private var musicPkg: String? = null
+    private var musicArt: Bitmap? = null
     private var toast: IslandNotif? = null
+    private var iconKey: String? = null
     private var lastForeground: String? = null
+    private var hiding = false
     private var usageCursor = System.currentTimeMillis() - 60_000
+
+    private val gestures by lazy {
+        GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onDown(e: MotionEvent): Boolean = true
+
+            override fun onSingleTapUp(e: MotionEvent): Boolean {
+                setExpanded(!expanded)
+                return true
+            }
+
+            override fun onFling(e1: MotionEvent?, e2: MotionEvent, vx: Float, vy: Float): Boolean {
+                val dy = if (e1 == null) 0f else e2.y - e1.y
+                return when {
+                    dy < -dp(24) && expanded -> { setExpanded(false); true }
+                    dy > dp(24) && !expanded -> { setExpanded(true); true }
+                    else -> false
+                }
+            }
+        })
+    }
 
     private val poll = object : Runnable {
         override fun run() {
@@ -168,7 +221,7 @@ class DynamicIslandService : Service() {
 
     private val tick = object : Runnable {
         override fun run() {
-            if (expanded && musicVisible) updateProgress()
+            if (expanded && mode == Mode.MUSIC) updateProgress()
             handler.postDelayed(this, 500)
         }
     }
@@ -177,17 +230,7 @@ class DynamicIslandService : Service() {
 
     private val toastOff = Runnable {
         toast = null
-        render()
-    }
-
-    private val notifListener: (IslandNotif?) -> Unit = { n ->
-        if (n != null && n.pkg != packageName) {
-            toast = n
-            handler.removeCallbacks(toastOff)
-            handler.postDelayed(toastOff, 4000)
-        }
-        renderNotifs()
-        render()
+        refresh()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -204,11 +247,11 @@ class DynamicIslandService : Service() {
         }
 
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
-        buildIsland()
+        buildUi()
         root.visibility = View.GONE
         wm.addView(root, params)
 
-        NotifBus.listener = notifListener
+        NotifBus.listener = { n -> onNotifEvent(n) }
         handler.post(poll)
         handler.post(tick)
     }
@@ -216,71 +259,108 @@ class DynamicIslandService : Service() {
     override fun onDestroy() {
         NotifBus.listener = null
         handler.removeCallbacksAndMessages(null)
-        if (::root.isInitialized && root.isAttachedToWindow) {
-            wm.removeView(root)
+        if (::root.isInitialized) {
+            root.animate().cancel()
+            if (root.isAttachedToWindow) wm.removeView(root)
         }
         super.onDestroy()
     }
 
-    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+    // ============ Arayüz kurulumu ============
 
-    private fun label(size: Float) = TextView(this).apply {
-        setTextColor(Color.WHITE)
-        textSize = size
-        maxLines = 1
-    }
-
-    private fun ctrl(symbol: String, action: () -> Unit): TextView = TextView(this).apply {
-        text = symbol
-        setTextColor(Color.WHITE)
-        textSize = 20f
-        setPadding(dp(12), dp(6), dp(12), dp(6))
+    private fun ctrl(icon: Int, desc: String, onTap: () -> Unit): ImageView = ImageView(this).apply {
+        setImageResource(icon)
+        setColorFilter(Color.WHITE)
+        contentDescription = desc
+        setPadding(dp(12), dp(10), dp(12), dp(10))
         setOnClickListener {
-            action()
-            scheduleCollapse()
+            onTap()
+            poke()
         }
     }
 
-    private fun buildIsland() {
-        val bg = GradientDrawable().apply {
-            setColor(Color.BLACK)
+    private fun seekBtn(icon: Int, desc: String, delta: Long): LinearLayout =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            addView(ctrl(icon, desc) { seek(delta) })
+            addView(TextView(this@DynamicIslandService).apply {
+                text = "5"
+                setTextColor(SUBTLE)
+                textSize = 9f
+                gravity = Gravity.CENTER
+            })
+        }
+
+    private fun glassBackground(): LayerDrawable {
+        val base = GradientDrawable(
+            GradientDrawable.Orientation.TOP_BOTTOM,
+            intArrayOf(GLASS_TOP, GLASS_BOTTOM)
+        ).apply {
             cornerRadius = dp(28).toFloat()
+            setStroke(dp(1), GLASS_RIM)
+        }
+        // Üst kenarda ince bir parlama, cam hissi için
+        val sheen = GradientDrawable(
+            GradientDrawable.Orientation.TOP_BOTTOM,
+            intArrayOf(Color.parseColor("#22FFFFFF"), Color.TRANSPARENT)
+        ).apply {
+            cornerRadii = floatArrayOf(
+                dp(28).toFloat(), dp(28).toFloat(), dp(28).toFloat(), dp(28).toFloat(),
+                0f, 0f, 0f, 0f
+            )
+        }
+        return LayerDrawable(arrayOf(base, sheen))
+    }
+
+    private fun buildUi() {
+        appIcon = ImageView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(20), dp(20)).apply { rightMargin = dp(8) }
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            clipToOutline = true
+            outlineProvider = ViewOutlineProvider.BACKGROUND
         }
 
-        dotBg = GradientDrawable().apply {
-            setColor(BLUE)
-            cornerRadius = dp(4).toFloat()
-        }
-        val dot = View(this).apply {
-            layoutParams = LinearLayout.LayoutParams(dp(8), dp(8)).apply { rightMargin = dp(8) }
-            background = dotBg
-        }
-
-        compactTv = label(13f).apply {
-            maxWidth = dp(260)
+        compactTv = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            textSize = 13f
+            maxLines = 1
+            maxWidth = dp(240)
             ellipsize = TextUtils.TruncateAt.END
         }
 
-        compactBox = LinearLayout(this).apply {
+        compactRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            addView(dot)
+            addView(appIcon)
             addView(compactTv)
         }
 
-        titleTv = label(14f).apply {
+        titleTv = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            textSize = 15f
+            maxLines = 1
             maxWidth = dp(260)
             ellipsize = TextUtils.TruncateAt.END
         }
-        artistTv = label(12f).apply {
-            setTextColor(GRAY)
+
+        artistTv = TextView(this).apply {
+            setTextColor(SUBTLE)
+            textSize = 12f
+            maxLines = 1
             maxWidth = dp(260)
             ellipsize = TextUtils.TruncateAt.END
         }
-        timeTv = label(11f).apply { setTextColor(GRAY) }
+
+        timeTv = TextView(this).apply {
+            setTextColor(SUBTLE)
+            textSize = 11f
+        }
 
         seekBar = SeekBar(this).apply {
             layoutParams = LinearLayout.LayoutParams(dp(260), LinearLayout.LayoutParams.WRAP_CONTENT)
+            progressTintList = ColorStateList.valueOf(MUSIC_GREEN)
+            thumbTintList = ColorStateList.valueOf(Color.WHITE)
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(sb: SeekBar, progress: Int, fromUser: Boolean) {}
                 override fun onStartTrackingTouch(sb: SeekBar) {
@@ -288,25 +368,30 @@ class DynamicIslandService : Service() {
                 }
                 override fun onStopTrackingTouch(sb: SeekBar) {
                     current?.transportControls?.seekTo(sb.progress.toLong())
-                    scheduleCollapse()
+                    poke()
                 }
             })
         }
 
-        playBtn = ctrl("▶") { togglePlay() }
+        playBtn = ctrl(android.R.drawable.ic_media_play, "Oynat/Duraklat") { togglePlay() }
 
         val controls = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
-            addView(ctrl("⏮") { current?.transportControls?.skipToPrevious() })
-            addView(ctrl("⏪5") { seek(-5000) })
+            addView(ctrl(android.R.drawable.ic_media_previous, "Önceki") {
+                current?.transportControls?.skipToPrevious()
+            })
+            addView(seekBtn(android.R.drawable.ic_media_rew, "5 saniye geri", -5000))
             addView(playBtn)
-            addView(ctrl("5⏩") { seek(5000) })
-            addView(ctrl("⏭") { current?.transportControls?.skipToNext() })
+            addView(seekBtn(android.R.drawable.ic_media_ff, "5 saniye ileri", 5000))
+            addView(ctrl(android.R.drawable.ic_media_next, "Sonraki") {
+                current?.transportControls?.skipToNext()
+            })
         }
 
         musicBox = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
             visibility = View.GONE
             addView(titleTv)
             addView(artistTv)
@@ -323,18 +408,18 @@ class DynamicIslandService : Service() {
         expandedBox = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
-            addView(notifBox)
             addView(musicBox)
+            addView(notifBox)
         }
 
         root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            background = bg
-            minimumWidth = dp(200)
-            setPadding(dp(14), dp(8), dp(14), dp(8))
-            addView(compactBox)
+            background = glassBackground()
+            minimumWidth = dp(150)
+            setPadding(dp(14), dp(8), dp(14), dp(10))
+            addView(compactRow)
             addView(expandedBox)
-            setOnClickListener { setExpanded(!expanded) }
+            setOnTouchListener { _, ev -> gestures.onTouchEvent(ev) }
         }
 
         val overlayType =
@@ -356,7 +441,174 @@ class DynamicIslandService : Service() {
         }
     }
 
-    // ============ Bildirim satırları ============
+    // ============ Mod seçimi ============
+
+    private fun nextAlarmText(): String? {
+        val am = getSystemService(ALARM_SERVICE) as AlarmManager
+        val info = am.nextAlarmClock ?: return null
+        val left = info.triggerTime - System.currentTimeMillis()
+        if (left < 0 || left > ALARM_WINDOW_MS) return null
+        return DateFormat.format("HH:mm", info.triggerTime).toString()
+    }
+
+    private fun pickMode(alarm: String?): Mode = when {
+        toast != null -> Mode.NOTIF
+        musicVisible -> Mode.MUSIC
+        NotifBus.items.isNotEmpty() -> Mode.NOTIF
+        alarm != null -> Mode.ALARM
+        SHOW_IDLE_CLOCK -> Mode.CLOCK
+        else -> Mode.HIDDEN
+    }
+
+    private fun applyMode(newMode: Mode, alarm: String?) {
+        val changed = newMode != mode
+        if (changed) {
+            // Ada şeklini yumuşakça değiştirir (morf)
+            TransitionManager.beginDelayedTransition(
+                root,
+                ChangeBounds().setDuration(320).setInterpolator(OvershootInterpolator(0.7f))
+            )
+        }
+        mode = newMode
+
+        when (newMode) {
+            Mode.NOTIF -> {
+                val t = toast
+                if (t != null) {
+                    compactTv.text = "${t.app}: ${t.title.ifBlank { t.text }}"
+                    setIcon(t.pkg, NOTIF_BLUE, null)
+                } else {
+                    compactTv.text = "${NotifBus.items.size} bildirim"
+                    setIcon(null, NOTIF_BLUE, null)
+                }
+            }
+            Mode.MUSIC -> {
+                compactTv.text = titleTv.text
+                setIcon(musicPkg, MUSIC_GREEN, musicArt)
+            }
+            Mode.ALARM -> {
+                compactTv.text = "Alarm $alarm"
+                setIcon(null, ALARM_ORANGE, null)
+            }
+            Mode.CLOCK -> {
+                compactTv.text = DateFormat.format("HH:mm", System.currentTimeMillis()).toString()
+                setIcon(null, SUBTLE, null)
+            }
+            Mode.HIDDEN -> {}
+        }
+
+        musicBox.visibility = if (newMode == Mode.MUSIC) View.VISIBLE else View.GONE
+
+        if (newMode == Mode.HIDDEN) hideRoot() else showRoot()
+    }
+
+    private fun setIcon(pkg: String?, accent: Int, art: Bitmap?) {
+        val key = "$pkg|$accent|${art?.hashCode()}"
+        if (key == iconKey) return
+        iconKey = key
+
+        if (art != null) {
+            appIcon.background = null
+            appIcon.setImageBitmap(art)
+            return
+        }
+
+        val drawable = pkg?.let { p ->
+            try {
+                packageManager.getApplicationIcon(p)
+            } catch (e: Exception) {
+                null
+            }
+        }
+
+        if (drawable != null) {
+            appIcon.background = null
+            appIcon.setImageDrawable(drawable)
+        } else {
+            appIcon.setImageDrawable(null)
+            appIcon.background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(accent)
+            }
+        }
+    }
+
+    // ============ Görünürlük ve yay animasyonu ============
+
+    private fun showRoot() {
+        hiding = false
+        if (root.visibility == View.VISIBLE && root.alpha == 1f && root.scaleX == 1f) return
+        if (root.visibility != View.VISIBLE) {
+            root.alpha = 0f
+            root.scaleX = 0.9f
+            root.scaleY = 0.9f
+            root.translationY = -dp(20).toFloat()
+            root.visibility = View.VISIBLE
+        }
+        root.animate().cancel()
+        root.animate()
+            .alpha(1f)
+            .scaleX(1f)
+            .scaleY(1f)
+            .translationY(0f)
+            .setDuration(420)
+            .setInterpolator(OvershootInterpolator(0.9f))
+            .start()
+    }
+
+    private fun hideRoot() {
+        if (hiding || root.visibility != View.VISIBLE) return
+        hiding = true
+        setExpanded(false)
+        root.animate().cancel()
+        root.animate()
+            .alpha(0f)
+            .scaleX(0.9f)
+            .scaleY(0.9f)
+            .translationY(-dp(20).toFloat())
+            .setDuration(240)
+            .withEndAction {
+                root.visibility = View.GONE
+                hiding = false
+            }
+            .start()
+    }
+
+    private fun setExpanded(value: Boolean) {
+        handler.removeCallbacks(autoCollapse)
+        if (expanded == value) return
+        if (value && mode != Mode.MUSIC && NotifBus.items.isEmpty()) return
+
+        expanded = value
+        TransitionManager.beginDelayedTransition(
+            root,
+            ChangeBounds().setDuration(340).setInterpolator(OvershootInterpolator(0.6f))
+        )
+        expandedBox.visibility = if (value) View.VISIBLE else View.GONE
+        compactRow.visibility = if (value && mode == Mode.MUSIC) View.GONE else View.VISIBLE
+        if (value) {
+            renderNotifs()
+            poke()
+        }
+    }
+
+    // Açık adada hareket olunca otomatik kapanma süresini yeniler
+    private fun poke() {
+        handler.removeCallbacks(autoCollapse)
+        if (expanded) handler.postDelayed(autoCollapse, AUTO_COLLAPSE_MS)
+    }
+
+    // ============ Bildirimler ============
+
+    private fun onNotifEvent(n: IslandNotif?) {
+        if (n != null && n.pkg != packageName) {
+            toast = n
+            handler.removeCallbacks(toastOff)
+            handler.postDelayed(toastOff, TOAST_MS)
+        }
+        renderNotifs()
+        refresh()
+    }
 
     private fun renderNotifs() {
         notifBox.removeAllViews()
@@ -364,106 +616,53 @@ class DynamicIslandService : Service() {
         notifBox.visibility = if (NotifBus.items.isEmpty()) View.GONE else View.VISIBLE
     }
 
-    private fun notifRow(n: IslandNotif): View = LinearLayout(this).apply {
-        orientation = LinearLayout.HORIZONTAL
-        gravity = Gravity.CENTER_VERTICAL
-        setPadding(0, dp(4), 0, dp(4))
-
-        val textCol = LinearLayout(this@DynamicIslandService).apply {
-            orientation = LinearLayout.VERTICAL
-            addView(TextView(this@DynamicIslandService).apply {
-                text = n.app
-                setTextColor(BLUE)
-                textSize = 11f
-                maxLines = 1
-            })
-            addView(TextView(this@DynamicIslandService).apply {
-                text = if (n.text.isNotBlank()) "${n.title}: ${n.text}" else n.title
-                setTextColor(Color.WHITE)
-                textSize = 13f
-                maxLines = 2
-                maxWidth = dp(240)
-                ellipsize = TextUtils.TruncateAt.END
-            })
+    private fun notifRow(n: IslandNotif): View {
+        val appTv = TextView(this).apply {
+            text = n.app
+            setTextColor(NOTIF_BLUE)
+            textSize = 11f
+            maxLines = 1
         }
-        addView(textCol)
 
-        addView(TextView(this@DynamicIslandService).apply {
+        val bodyTv = TextView(this).apply {
+            text = if (n.text.isNotBlank()) "${n.title}: ${n.text}" else n.title
+            setTextColor(Color.WHITE)
+            textSize = 13f
+            maxLines = 2
+            maxWidth = dp(240)
+            ellipsize = TextUtils.TruncateAt.END
+        }
+
+        val textCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(appTv)
+            addView(bodyTv)
+        }
+
+        val closeTv = TextView(this).apply {
             text = "✕"
-            setTextColor(GRAY)
-            textSize = 16f
+            setTextColor(SUBTLE)
+            textSize = 15f
             setPadding(dp(12), dp(4), dp(4), dp(4))
             setOnClickListener {
                 IslandNotificationListener.instance?.cancelNotification(n.key)
                 NotifBus.remove(n.key)
             }
-        })
+        }
 
-        setOnClickListener { openNotif(n) }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(6), 0, dp(6))
+            addView(textCol, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            addView(closeTv)
+            setOnClickListener { openNotif(n) }
+        }
     }
 
     private fun openNotif(n: IslandNotif) {
-        try {
-            n.intent?.send()
-        } catch (e: PendingIntent.CanceledException) {
-        }
+        runCatching { n.intent?.send() }
         setExpanded(false)
-    }
-
-    // ============ Görünürlük ve genişleme ============
-
-    private fun render() {
-        val t = toast
-        when {
-            t != null -> {
-                dotBg.setColor(BLUE)
-                compactTv.text = "${t.app}: ${t.title.ifBlank { t.text }}"
-            }
-            musicVisible -> {
-                dotBg.setColor(GREEN)
-                compactTv.text = titleTv.text
-            }
-            else -> {
-                dotBg.setColor(BLUE)
-                compactTv.text = "${NotifBus.items.size} bildirim"
-            }
-        }
-
-        musicBox.visibility = if (musicVisible) View.VISIBLE else View.GONE
-
-        val hasNotifs = NotifBus.items.isNotEmpty()
-        if (t != null || musicVisible || hasNotifs) showRoot() else hideRoot()
-    }
-
-    private fun showRoot() {
-        if (root.visibility == View.VISIBLE) return
-        root.visibility = View.VISIBLE
-        root.translationY = -dp(60).toFloat()
-        root.animate().translationY(0f).setDuration(350).start()
-    }
-
-    private fun hideRoot() {
-        if (root.visibility != View.VISIBLE) return
-        root.visibility = View.GONE
-        setExpanded(false)
-    }
-
-    private fun setExpanded(value: Boolean) {
-        handler.removeCallbacks(autoCollapse)
-        if (expanded == value) return
-        expanded = value
-        TransitionManager.beginDelayedTransition(root, AutoTransition())
-        compactBox.visibility = if (value) View.GONE else View.VISIBLE
-        expandedBox.visibility = if (value) View.VISIBLE else View.GONE
-        if (value) {
-            renderNotifs()
-            scheduleCollapse()
-        }
-    }
-
-    private fun scheduleCollapse() {
-        handler.removeCallbacks(autoCollapse)
-        if (expanded) handler.postDelayed(autoCollapse, 5000)
     }
 
     // ============ Ana döngü ============
@@ -473,21 +672,36 @@ class DynamicIslandService : Service() {
 
         val session = pickSession()
         current = session
+        if (session != null) musicPkg = session.packageName
 
         val state = session?.playbackState?.state
         val active = session != null &&
                 (state == PlaybackState.STATE_PLAYING || state == PlaybackState.STATE_PAUSED)
 
+        // Müzik uygulaması ön plandaysa müzik adası gizlenir
         musicVisible = active && session?.packageName != lastForeground
 
         if (musicVisible && session != null) {
             val m = session.metadata
             titleTv.text = m?.getString(MediaMetadata.METADATA_KEY_TITLE) ?: "Müzik"
-            artistTv.text = m?.getString(MediaMetadata.METADATA_KEY_ARTIST) ?: ""
-            playBtn.text = if (state == PlaybackState.STATE_PLAYING) "⏸" else "▶"
+            artistTv.text = m?.getString(MediaMetadata.METADATA_KEY_ARTIST).orEmpty()
+            musicArt = m?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
+                ?: m?.getBitmap(MediaMetadata.METADATA_KEY_ART)
+            playBtn.setImageResource(
+                if (state == PlaybackState.STATE_PLAYING) android.R.drawable.ic_media_pause
+                else android.R.drawable.ic_media_play
+            )
+        } else {
+            musicArt = null
         }
 
-        render()
+        val alarm = nextAlarmText()
+        val newMode = pickMode(alarm)
+        applyMode(newMode, alarm)
+
+        if (mode == Mode.CLOCK || mode == Mode.ALARM) {
+            if (expanded) setExpanded(false)
+        }
     }
 
     private fun pickSession(): MediaController? {
@@ -548,6 +762,7 @@ class DynamicIslandService : Service() {
         timeTv.text = "${fmt(pos)} / ${fmt(dur)}"
     }
 
+    // Android konumu yalnızca son güncelleme anında verir, aradaki süreyi hesaplıyoruz
     private fun currentPosition(st: PlaybackState): Long {
         val elapsed = if (st.state == PlaybackState.STATE_PLAYING)
             ((SystemClock.elapsedRealtime() - st.lastPositionUpdateTime) * st.playbackSpeed).toLong()
@@ -574,7 +789,7 @@ class DynamicIslandService : Service() {
 
         val notification: Notification = NotificationCompat.Builder(this, channelId)
             .setSmallIcon(android.R.drawable.ic_menu_info_details)
-            .setContentTitle("Dynamic Island aktif")
+            .setContentTitle("Dynamic Island çalışıyor")
             .setPriority(NotificationCompat.PRIORITY_MIN)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .build()
@@ -591,6 +806,8 @@ class DynamicIslandService : Service() {
 
 class MainActivity : Activity() {
 
+    private lateinit var statusTv: TextView
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -598,35 +815,76 @@ class MainActivity : Activity() {
             requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), 0)
         }
 
-        val pad = (24 * resources.displayMetrics.density).toInt()
+        val pad = dp(24)
+
+        statusTv = TextView(this)
+        statusTv.textSize = 15f
+        statusTv.setPadding(0, dp(16), 0, dp(16))
+
+        val titleTv = TextView(this)
+        titleTv.text = "Dynamic Island"
+        titleTv.textSize = 26f
+
         val root = LinearLayout(this)
         root.orientation = LinearLayout.VERTICAL
         root.setPadding(pad, pad, pad, pad)
-
-        root.addView(btn("1. Diğer uygulamaların üzerinde göster") {
+        root.addView(titleTv)
+        root.addView(statusTv)
+        root.addView(button("Üstte göster izni ver") {
             startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
         })
-
-        root.addView(btn("2. Bildirim erişimi (tüm bildirimler + müzik)") {
+        root.addView(button("Bildirim erişimi ver") {
             startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
         })
-
-        root.addView(btn("3. Kullanım erişimi (uygulama algılama)") {
+        root.addView(button("Kullanım erişimi ver") {
             startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
         })
-
-        root.addView(btn("4. Adayı başlat") {
-            if (Settings.canDrawOverlays(this)) {
-                startForegroundService(Intent(this, DynamicIslandService::class.java))
-            } else {
-                Toast.makeText(this, "Önce 1. izni ver", Toast.LENGTH_SHORT).show()
-            }
-        })
+        root.addView(button("Adayı başlat") { startIsland() })
 
         setContentView(root)
     }
 
-    private fun btn(label: String, onClick: () -> Unit): Button {
+    override fun onResume() {
+        super.onResume()
+        refreshStatus()
+    }
+
+    private fun startIsland() {
+        if (Settings.canDrawOverlays(this)) {
+            startForegroundService(Intent(this, DynamicIslandService::class.java))
+        } else {
+            Toast.makeText(this, "Önce üstte göster iznini ver", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun refreshStatus() {
+        val overlay = Settings.canDrawOverlays(this)
+        val listener = isListenerEnabled()
+        val usage = hasUsageAccess()
+        statusTv.text = "Üstte göster: ${mark(overlay)}\n" +
+                "Bildirim erişimi: ${mark(listener)}\n" +
+                "Kullanım erişimi: ${mark(usage)}"
+    }
+
+    private fun mark(ok: Boolean) = if (ok) "✓ Açık" else "✗ Kapalı"
+
+    private fun isListenerEnabled(): Boolean {
+        val flat = Settings.Secure.getString(contentResolver, "enabled_notification_listeners")
+            ?: return false
+        return flat.contains(packageName)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun hasUsageAccess(): Boolean {
+        val ops = getSystemService(APP_OPS_SERVICE) as AppOpsManager
+        return ops.checkOpNoThrow(
+            AppOpsManager.OPSTR_GET_USAGE_STATS,
+            Process.myUid(),
+            packageName
+        ) == AppOpsManager.MODE_ALLOWED
+    }
+
+    private fun button(label: String, onClick: () -> Unit): Button {
         val b = Button(this)
         b.text = label
         b.setOnClickListener { onClick() }
