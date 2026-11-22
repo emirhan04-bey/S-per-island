@@ -57,7 +57,7 @@ data class IslandNotif(
 )
 
 object NotifBus {
-    val items = mutableListOf<IslandNotif>() // en yeni en başta
+    val items = mutableListOf<IslandNotif>()
     var listener: ((IslandNotif?) -> Unit)? = null
     private val main = Handler(Looper.getMainLooper())
 
@@ -78,7 +78,7 @@ object NotifBus {
     }
 }
 
-// ============ Bildirim dinleyici: tüm bildirimleri alır ============
+// ============ Bildirim dinleyici ============
 
 class IslandNotificationListener : NotificationListenerService() {
 
@@ -96,8 +96,8 @@ class IslandNotificationListener : NotificationListenerService() {
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification) {
-        if (sbn.packageName == packageName) return           // kendi bildirimimiz
-        if (sbn.isOngoing) return                            // kalıcı servis bildirimleri
+        if (sbn.packageName == packageName) return
+        if (sbn.isOngoing) return
         if ((sbn.notification.flags and Notification.FLAG_GROUP_SUMMARY) != 0) return
 
         val extras = sbn.notification.extras
@@ -406,7 +406,6 @@ class DynamicIslandService : Service() {
         try {
             n.intent?.send()
         } catch (e: PendingIntent.CanceledException) {
-            // Bildirim artık geçerli değil, sessizce geç
         }
         setExpanded(false)
     }
@@ -479,7 +478,6 @@ class DynamicIslandService : Service() {
         val active = session != null &&
                 (state == PlaybackState.STATE_PLAYING || state == PlaybackState.STATE_PAUSED)
 
-        // Müzik uygulaması ön plandaysa müzik adası gizlenir
         musicVisible = active && session?.packageName != lastForeground
 
         if (musicVisible && session != null) {
@@ -497,7 +495,7 @@ class DynamicIslandService : Service() {
         val sessions = try {
             msm.getActiveSessions(ComponentName(this, IslandNotificationListener::class.java))
         } catch (e: SecurityException) {
-            return null // Bildirim erişimi verilmemiş
+            return null
         }
         return sessions.firstOrNull { it.playbackState?.state == PlaybackState.STATE_PLAYING }
             ?: sessions.firstOrNull { it.playbackState?.state == PlaybackState.STATE_PAUSED }
@@ -550,7 +548,6 @@ class DynamicIslandService : Service() {
         timeTv.text = "${fmt(pos)} / ${fmt(dur)}"
     }
 
-    // Android pozisyonu yalnızca son güncelleme anında verir; aradaki süreyi hesaplıyoruz
     private fun currentPosition(st: PlaybackState): Long {
         val elapsed = if (st.state == PlaybackState.STATE_PLAYING)
             ((SystemClock.elapsedRealtime() - st.lastPositionUpdateTime) * st.playbackSpeed).toLong()
@@ -559,7 +556,7 @@ class DynamicIslandService : Service() {
     }
 
     private fun duration(c: MediaController): Long =
-        c.metadata?.getLong(MediaMetadata.METADATA_KEY_DURATION, 0L) ?: 0L
+        c.metadata?.getLong(MediaMetadata.METADATA_KEY_DURATION) ?: 0L
 
     private fun fmt(ms: Long): String {
         val s = ms / 1000
@@ -606,3 +603,12 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(pad, pad, pad, pad)
         }
+
+        root.addView(btn("1. Diğer uygulamaların üzerinde göster") {
+            startActivity(
+                Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
+            )
+        })
+
+        root.addView(btn("2. Bildirim erişimi (tüm bildirimler + müzik)") {
+            startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTIN
