@@ -599,16 +599,37 @@ class MainActivity : Activity() {
         }
 
         val pad = (24 * resources.displayMetrics.density).toInt()
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(pad, pad, pad, pad)
-        }
+        val root = LinearLayout(this)
+        root.orientation = LinearLayout.VERTICAL
+        root.setPadding(pad, pad, pad, pad)
 
         root.addView(btn("1. Diğer uygulamaların üzerinde göster") {
-            startActivity(
-                Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
-            )
+            startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
         })
 
         root.addView(btn("2. Bildirim erişimi (tüm bildirimler + müzik)") {
-            startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTIN
+            startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+        })
+
+        root.addView(btn("3. Kullanım erişimi (uygulama algılama)") {
+            startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
+        })
+
+        root.addView(btn("4. Adayı başlat") {
+            if (Settings.canDrawOverlays(this)) {
+                startForegroundService(Intent(this, DynamicIslandService::class.java))
+            } else {
+                Toast.makeText(this, "Önce 1. izni ver", Toast.LENGTH_SHORT).show()
+            }
+        })
+
+        setContentView(root)
+    }
+
+    private fun btn(label: String, onClick: () -> Unit): Button {
+        val b = Button(this)
+        b.text = label
+        b.setOnClickListener { onClick() }
+        return b
+    }
+}
